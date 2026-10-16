@@ -1,15 +1,13 @@
-// ゲームの静的データ（シンプル版）：会社・ニュースカード・キャラ・レッスン
+// ゲームの静的データ（ルーレット版）：会社・ニュースカード・ルーレット盤・キャラ・レッスン
 // 世界観：石畳とランタンの灯りに包まれた絵本の港町「ランタン通り」
 
 export const TOWN_NAME = 'ランタン通り';
 
-// 会社。numbers はサイコロ2個の合計（カタンの数字チップ）。この目が出るとその会社にニュースが起きる。
-//   6・8 → 36回に10回  …  2・12 → 36回に2回
-// cards はニュースカード。p は株価の変化(%)、div は「1株につき○G」の配当
+// 会社。cards はニュースカード。p は株価の変化(%)、div は「1株につき○G」の配当
 export const COMPANIES = [
   {
-    id: 'lantern', name: 'ランタン工房', short: 'ランタン', emoji: '🏮', numbers: [6, 8], start: 120, color: '#d9892b',
-    mood: '安定。小さくコツコツ', risk: 1,
+    id: 'lantern', name: 'ランタン工房', short: 'ランタン', emoji: '🏮', start: 120, color: '#e0952f',
+    mood: '安定。小さくコツコツ',
     cards: [
       { t: 'ランタン祭りで町が大にぎわい', p: 5 },
       { t: '新作ランプが大人気', p: 8 },
@@ -24,8 +22,8 @@ export const COMPANIES = [
     ],
   },
   {
-    id: 'cobble', name: '石畳ギルド', short: '石畳', emoji: '🧱', numbers: [5, 9], start: 100, color: '#8a7f8f',
-    mood: 'そこそこ動く', risk: 2,
+    id: 'cobble', name: '石畳ギルド', short: '石畳', emoji: '🧱', start: 100, color: '#8f8198',
+    mood: 'そこそこ動く',
     cards: [
       { t: '町の大通りを石畳に！大工事', p: 10 },
       { t: '新しい橋の工事を引き受けた', p: 15 },
@@ -39,8 +37,8 @@ export const COMPANIES = [
     ],
   },
   {
-    id: 'herb', name: '薬草園カモミラ', short: '薬草', emoji: '🌿', numbers: [4, 10], start: 80, color: '#4f8a5b',
-    mood: '当たるとよく伸びる', risk: 3,
+    id: 'herb', name: '薬草園カモミラ', short: '薬草', emoji: '🌿', start: 80, color: '#58995f',
+    mood: '当たるとよく伸びる',
     cards: [
       { t: '新しい薬が大ヒット', p: 20 },
       { t: 'カゼが流行して薬が売れまくり', p: 25 },
@@ -53,8 +51,8 @@ export const COMPANIES = [
     ],
   },
   {
-    id: 'fish', name: '魚の塔商会', short: 'さかな', emoji: '🐟', numbers: [3, 11], start: 60, color: '#2f7f9e',
-    mood: '大波が来る', risk: 4,
+    id: 'fish', name: '魚の塔商会', short: 'さかな', emoji: '🐟', start: 60, color: '#3a8fb0',
+    mood: '大波が来る',
     cards: [
       { t: '巨大マグロが釣れた！', p: 30 },
       { t: '宝の沈没船を発見！', p: 40 },
@@ -67,8 +65,8 @@ export const COMPANIES = [
     ],
   },
   {
-    id: 'dragon', name: '竜の鉱山', short: '竜の山', emoji: '⛏️', numbers: [2, 12], start: 40, color: '#7c4dbd',
-    mood: '一発逆転か、ドカンか', risk: 5,
+    id: 'dragon', name: '竜の鉱山', short: '竜の山', emoji: '⛏️', start: 40, color: '#8a5cd0',
+    mood: '一発逆転か、ドカンか',
     cards: [
       { t: 'ドラゴンの金塊を発見！', p: 60 },
       { t: '伝説の竜石が出た！', p: 80 },
@@ -82,16 +80,46 @@ export const COMPANIES = [
   },
 ];
 
-// ゾロ目で起きる「号外」
+// ルーレット盤。20マス。マスの数がそのまま当たりやすさ。
+//   type: co=会社のニュース / robber=盗賊 / extra=号外 / lucky=回した人に / rescue=ビリの人に
+export const WHEEL = [
+  { type: 'co', co: 'lantern' },
+  { type: 'co', co: 'cobble' },
+  { type: 'co', co: 'herb' },
+  { type: 'robber' },
+  { type: 'co', co: 'lantern' },
+  { type: 'co', co: 'fish' },
+  { type: 'co', co: 'cobble' },
+  { type: 'lucky' },
+  { type: 'co', co: 'lantern' },
+  { type: 'co', co: 'herb' },
+  { type: 'co', co: 'dragon' },
+  { type: 'co', co: 'cobble' },
+  { type: 'robber' },
+  { type: 'co', co: 'lantern' },
+  { type: 'co', co: 'fish' },
+  { type: 'co', co: 'herb' },
+  { type: 'extra' },
+  { type: 'co', co: 'cobble' },
+  { type: 'co', co: 'lantern' },
+  { type: 'rescue' },
+];
+export const WHEEL_META = {
+  robber: { emoji: '🏴‍☠️', label: '盗賊', color: '#4b3a6b', desc: '回した人が好きな会社に送りこむ。その株は −25%' },
+  extra: { emoji: '📰', label: '号外', color: '#e07a2f', desc: '町じゅうの株が +25% か −25%' },
+  lucky: { emoji: '🎁', label: 'ラッキー', color: '#d4a017', desc: '回した人に 100G' },
+  rescue: { emoji: '🍀', label: 'おたすけ', color: '#2f9e6b', desc: 'ビリの人に 150G' },
+};
+export const LUCKY_AMOUNT = 100;
+export const RESCUE_AMOUNT = 150;
+
+// 号外
 export const EXTRAS = {
   boom: { t: '号外！お祭りブームで町じゅう大もうけ', p: 25, emoji: '📈' },
   crash: { t: '号外！となりの国と戦争のうわさ、町じゅう大パニック', p: -25, emoji: '📉' },
 };
 
-// 2個のサイコロの合計が出る回数（36通り中）
-export const DICE_WAYS = { 2: 1, 3: 2, 4: 3, 5: 4, 6: 5, 7: 6, 8: 5, 9: 4, 10: 3, 11: 2, 12: 1 };
-
-// キャラクター（見た目だけ。特技はない）
+// キャラクター（見た目だけ）
 export const CHARACTERS = [
   { id: 'lumi', name: 'ルミ', emoji: '🐰', title: 'ランプ屋のうさぎ', color: '#f4a261' },
   { id: 'mimi', name: 'ミミ', emoji: '🐭', title: '行商ねずみ', color: '#b89c93' },

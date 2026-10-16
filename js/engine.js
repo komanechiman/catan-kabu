@@ -1,16 +1,20 @@
-// ゲームエンジン（シンプル版）：状態(state)を受け取って書き換える純粋なルール関数の集まり。
+// ゲームエンジン（ルーレット版）：状態(state)を受け取って書き換える純粋なルール関数の集まり。
 // Firebase のトランザクション内から呼ばれるので、ここでは通信もDOMも触らない。
 // すべての関数は { ok: true } か { ok: false, error: 'メッセージ' } を返し、state をその場で書き換える。
-import { COMPANIES, CHARACTERS, EXTRAS, fmt } from './data.js';
+//
+// 進行は人生ゲーム式の順番制：
+//   自分の番 → ルーレットを回す（spin）→ ニュース（盗賊なら行き先を選ぶ robber）→ 買う/売る（trade）→ 次の人
+//   全員が1回ずつ回したら1ラウンド。決めたラウンド数が終わったら結果。
+import { COMPANIES, CHARACTERS, WHEEL, EXTRAS, LUCKY_AMOUNT, RESCUE_AMOUNT, fmt } from './data.js';
 
 export const RULES = {
   START_CASH: 1000,     // スタートのお金
-  DRIFT: 0.05,          // ニュースがない会社の小さな動き（±5%）
+  DRIFT: 0.03,          // ニュースがない会社の小さな動き（±3%）
   ROBBER_DROP: 0.25,    // 盗賊におそわれた会社の下落率
   MIN_PRICE: 5,
   MAX_PLAYERS: 4,
-  LOG_MAX: 60,
-  ROUND_OPTIONS: [8, 10, 12, 15],
+  LOG_MAX: 80,
+  ROUND_OPTIONS: [5, 8, 10, 12, 15],
 };
 
 export const CO_IDS = COMPANIES.map(c => c.id);
@@ -22,24 +26,23 @@ export const charInfo = id => charMap[id] || null;
 const ok = () => ({ ok: true });
 const err = m => ({ ok: false, error: m });
 const R = Math.round;
-const die = rng => 1 + Math.floor(rng() * 6);
 const clampPrice = p => Math.max(RULES.MIN_PRICE, R(p));
 const toInt = (v, min = 0) => {
   const n = Math.floor(Number(v));
   return Number.isFinite(n) && n >= min ? n : NaN;
 };
 
-export const DEFAULT_SETTINGS = { rounds: 10, stakeLoser: '', stakeWinner: '' };
-const DEFAULT_STATS = { trades: 0, peak: 0, bestGain: 0, worstLoss: 0, dragonMax: 0, sells: 0 };
+export const DEFAULT_SETTINGS = { rounds: 8, stakeLoser: '', stakeWinner: '' };
+const DEFAULT_STATS = { trades: 0, peak: 0, bestGain: 0, worstLoss: 0, dragonMax: 0, sells: 0, lucky: 0 };
 
 // ---------- 状態の作成と正規化 ----------
 
 export function newState(code, hostId, settings = {}, now = Date.now()) {
   const s = {
-    code, hostId, createdAt: now, phase: 'lobby', round: 0,
+    code, hostId, createdAt: now, phase: 'lobby', round: 0, turnIdx: 0, turn: null, spinNo: 0,
     settings: sanitizeSettings({ ...DEFAULT_SETTINGS, ...settings }),
-    order: [], dealer: null, players: {}, prices: {}, decks: {},
-    robber: null, lastRoll: null, log: [], saved: false, finishedAt: 0,
+    order: [], players: {}, prices: {}, decks: {},
+    robber: null, lastSpin: null, log: [], saved: false, finishedAt: 0,
   };
   for (const c of COMPANIES) s.prices[c.id] = { price: c.start, prev: c.start, history: [c.start] };
   return s;
@@ -54,6 +57,8 @@ export function normalize(s) {
   s.prices = s.prices || {};
   s.decks = s.decks || {};
   s.round = s.round || 0;
+  s.turnIdx = s.turnIdx || 0;
+  s.spinNo = s.spinNo || 0;
   for (const c of COMPANIES) {
     const x = (s.prices[c.id] = s.prices[c.id] || { price: c.start, prev: c.start });
     x.history = x.history || [x.price];
@@ -63,16 +68,18 @@ export function normalize(s) {
     p.shares = p.shares || {};
     p.history = p.history || [];
     p.stats = { ...DEFAULT_STATS, ...(p.stats || {}) };
-    p.done = !!p.done;
     p.cash = p.cash || 0;
   }
-  if (s.lastRoll) { s.lastRoll.moves = s.lastRoll.moves || {}; s.lastRoll.ranks = s.lastRoll.ranks || []; s.lastRoll.divs = s.lastRoll.divs || []; }
+  if (s.lastSpin) {
+    const L = s.lastSpin;
+    L.moves = L.moves || {}; L.ranks = L.ranks || []; L.divs = L.divs || []; L.before = L.before || {};
+  }
   return s;
 }
 
 function sanitizeSettings(st) {
   return {
-    rounds: RULES.ROUND_OPTIONS.includes(Number(st.rounds)) ? Number(st.rounds) : 10,
+    rounds: RULES.ROUND_OPTIONS.includes(Number(st.rounds)) ? Number(st.rounds) : 8,
     stakeLoser: String(st.stakeLoser || '').slice(0, 40),
     stakeWinner: String(st.stakeWinner || '').slice(0, 40),
   };
@@ -104,7 +111,7 @@ export function addPlayer(s, { id, name, charId }, now = Date.now()) {
   if (Object.values(s.players).some(p => p.name === name)) return err('同じ名前の人がもういる');
   if (!charMap[charId]) return err('キャラを選んで');
   if (Object.values(s.players).some(p => p.charId === charId)) return err('そのキャラはもう選ばれてる');
-  s.players[id] = { id, name, charId, cash: RULES.START_CASH, shares: {}, history: [], stats: { ...DEFAULT_STATS }, done: false, joinedAt: now };
+  s.players[id] = { id, name, charId, cash: RULES.START_CASH, shares: {}, history: [], stats: { ...DEFAULT_STATS }, joinedAt: now };
   s.order.push(id);
   return ok();
 }
@@ -130,11 +137,13 @@ export function startGame(s, pid, rng = Math.random, now = Date.now()) {
   if (s.phase !== 'lobby') return err('もう始まってる');
   if (s.order.length < 1) return err('プレイヤーがいない');
   shuffle(s.order, rng);
-  s.round = 0;
-  s.dealer = s.order[0];
-  s.phase = 'roll';
+  s.round = 1;
+  s.turnIdx = 0;
+  s.turn = s.order[0];
+  s.spinNo = 0;
+  s.phase = 'spin';
   s.robber = null;
-  s.lastRoll = null;
+  s.lastSpin = null;
   s.log = [];
   for (const c of COMPANIES) {
     s.prices[c.id] = { price: c.start, prev: c.start, history: [c.start] };
@@ -145,7 +154,6 @@ export function startGame(s, pid, rng = Math.random, now = Date.now()) {
     p.shares = {};
     p.stats = { ...DEFAULT_STATS, peak: RULES.START_CASH };
     p.history = [RULES.START_CASH];
-    p.done = false;
   }
   s.startedAt = now;
   log(s, `🏁 ゲーム開始！ 順番：${players(s).map(p => p.name).join(' → ')}`);
@@ -168,7 +176,7 @@ export function ranking(s) {
   return arr.map((x, i) => ({ ...x, rank: i + 1 }));
 }
 
-// ---------- サイコロとニュース ----------
+// ---------- ルーレット ----------
 
 function drawCard(s, coId, rng) {
   const c = coMap[coId];
@@ -177,104 +185,107 @@ function drawCard(s, coId, rng) {
   return { idx, ...c.cards[idx] };
 }
 
-export function rollDice(s, pid, rng = Math.random, now = Date.now()) {
-  if (s.phase !== 'roll') return err('今はサイコロの時間じゃない');
-  if (s.dealer !== pid) return err('サイコロを振れるのは親だけ');
-  const d1 = die(rng), d2 = die(rng);
-  const sum = d1 + d2;
-  s.round += 1;
-  const roll = { round: s.round, d1, d2, sum, dealer: pid, co: null, card: null, moves: {}, divs: [], extra: null, robberTarget: null, ranks: [] };
+export function spin(s, pid, rng = Math.random, now = Date.now()) {
+  if (s.phase !== 'spin') return err('今はルーレットの時間じゃない');
+  if (s.turn !== pid) return err('ルーレットを回せるのは番の人だけ');
+  const seg = Math.floor(rng() * WHEEL.length);
+  const jitter = 0.15 + rng() * 0.7; // マスの端ぎりぎりに止まらないように
+  const w = WHEEL[seg];
+  const p = s.players[pid];
+  s.spinNo += 1;
+  const before = {};
+  for (const x of players(s)) before[x.id] = netWorth(s, x);
+  const L = { id: s.spinNo, round: s.round, by: pid, seg, jitter, type: w.type, co: w.co || null, card: null, divs: [], extra: null, lucky: 0, rescue: null, robberTarget: null, moves: {}, before, ranks: [] };
   for (const id of CO_IDS) s.prices[id].prev = s.prices[id].price;
 
-  if (sum !== 7) {
-    const c = COMPANIES.find(x => x.numbers.includes(sum));
-    roll.co = c.id;
+  if (w.type === 'co') {
+    const c = coMap[w.co];
     const card = drawCard(s, c.id, rng);
-    roll.card = { t: card.t, p: card.p, div: card.div || 0 };
+    L.card = { t: card.t, p: card.p, div: card.div || 0 };
     if (card.p) s.prices[c.id].price = clampPrice(s.prices[c.id].price * (1 + card.p / 100));
     if (card.div) {
-      for (const p of players(s)) {
-        const q = p.shares[c.id] || 0;
-        if (q > 0) { const d = q * card.div; p.cash += d; roll.divs.push({ id: p.id, amount: d }); }
+      for (const x of players(s)) {
+        const q = x.shares[c.id] || 0;
+        if (q > 0) { const d = q * card.div; x.cash += d; L.divs.push({ id: x.id, amount: d }); }
       }
     }
     log(s, `${c.emoji} ${c.short}：${card.t}${card.p ? `（${card.p > 0 ? '+' : ''}${card.p}%）` : card.div ? `（1株 ${card.div}G）` : ''}`);
-  }
-  // ニュースがない会社は小さく動く
-  for (const c of COMPANIES) {
-    if (c.id === roll.co) continue;
-    const r = (rng() * 2 - 1) * RULES.DRIFT;
-    const before = s.prices[c.id].price;
-    s.prices[c.id].price = clampPrice(before * (1 + r));
-    roll.moves[c.id] = s.prices[c.id].price / before - 1;
-  }
-  // ゾロ目は号外
-  if (d1 === d2) {
+  } else if (w.type === 'extra') {
     const kind = rng() < 0.5 ? 'boom' : 'crash';
     const ex = EXTRAS[kind];
-    roll.extra = kind;
+    L.extra = kind;
     for (const id of CO_IDS) s.prices[id].price = clampPrice(s.prices[id].price * (1 + ex.p / 100));
     log(s, `${ex.emoji} ${ex.t}（${ex.p > 0 ? '+' : ''}${ex.p}%）`);
+  } else if (w.type === 'lucky') {
+    p.cash += LUCKY_AMOUNT;
+    p.stats.lucky += 1;
+    L.lucky = LUCKY_AMOUNT;
+    log(s, `🎁 ラッキー！ ${p.name} に ${fmt(LUCKY_AMOUNT)}G`);
+  } else if (w.type === 'rescue') {
+    const rk = ranking(s);
+    const last = s.players[rk[rk.length - 1].id];
+    last.cash += RESCUE_AMOUNT;
+    L.rescue = { id: last.id, amount: RESCUE_AMOUNT };
+    log(s, `🍀 おたすけ！ ビリの ${last.name} に ${fmt(RESCUE_AMOUNT)}G`);
+  } else if (w.type === 'robber') {
+    log(s, `🏴‍☠️ 盗賊があらわれた！ ${p.name} が行き先を決める`);
   }
-  s.lastRoll = roll;
-  if (sum === 7) {
-    s.phase = 'robber';
-    log(s, `🏴‍☠️ 7！ 盗賊があらわれた`);
-  } else {
-    settle(s, now);
+  // ニュースがなかった会社は小さく動く
+  for (const c of COMPANIES) {
+    if (w.type === 'co' && c.id === w.co) continue;
+    const r = (rng() * 2 - 1) * RULES.DRIFT;
+    const b = s.prices[c.id].price;
+    s.prices[c.id].price = clampPrice(b * (1 + r));
+    L.moves[c.id] = s.prices[c.id].price / b - 1;
   }
+  s.lastSpin = L;
+  if (w.type === 'robber') s.phase = 'robber';
+  else settleSpin(s, now);
   return ok();
 }
 
 export function placeRobber(s, pid, coId, now = Date.now()) {
   if (s.phase !== 'robber') return err('今は盗賊を置く時間じゃない');
-  if (s.dealer !== pid) return err('盗賊を置けるのは親だけ');
+  if (s.turn !== pid) return err('盗賊を置けるのは番の人だけ');
   const c = coMap[coId];
   if (!c) return err('そんな会社はない');
   s.robber = coId;
   const before = s.prices[coId].price;
   s.prices[coId].price = clampPrice(before * (1 - RULES.ROBBER_DROP));
-  s.lastRoll.robberTarget = coId;
+  s.lastSpin.robberTarget = coId;
+  delete s.lastSpin.moves[coId];
   log(s, `🏴‍☠️ ${s.players[pid].name} が盗賊を ${c.emoji}${c.short} に送りこんだ（−${R(RULES.ROBBER_DROP * 100)}%）`);
-  settle(s, now);
+  settleSpin(s, now);
   return ok();
 }
 
-// ラウンドの後始末：記録と順位
-function settle(s, now) {
-  const prevRankOf = {};
-  for (const p of players(s)) {
-    const prev = p.history.length ? p.history[p.history.length - 1] : RULES.START_CASH;
-    prevRankOf[p.id] = 0;
-    const nw = netWorth(s, p);
-    p.history[s.round] = nw;
-    if (nw > p.stats.peak) p.stats.peak = nw;
-    const gain = nw - prev;
-    if (gain > p.stats.bestGain) p.stats.bestGain = gain;
-    if (gain < p.stats.worstLoss) p.stats.worstLoss = gain;
-    const dq = p.shares.dragon || 0;
-    if (dq > p.stats.dragonMax) p.stats.dragonMax = dq;
-    p.done = false;
-  }
-  // 前ラウンドの順位は履歴から計算
-  if (s.round > 1) {
-    const prevList = players(s).map(p => ({ id: p.id, nw: p.history[s.round - 1] || 0 })).sort((a, b) => b.nw - a.nw);
-    prevList.forEach((x, i) => { prevRankOf[x.id] = i + 1; });
+// 回した後の後始末：順位の記録。売り買いタイムへ
+function settleSpin(s, now) {
+  const prevRank = {};
+  if (s.lastSpin && s.lastSpin.before) {
+    const prev = Object.entries(s.lastSpin.before).map(([id, nw]) => ({ id, nw })).sort((a, b) => b.nw - a.nw);
+    prev.forEach((x, i) => { prevRank[x.id] = i + 1; });
   }
   const rk = ranking(s);
-  s.lastRoll.ranks = rk.map(r => ({ id: r.id, nw: r.nw, rank: r.rank, delta: prevRankOf[r.id] ? prevRankOf[r.id] - r.rank : 0 }));
-  for (const id of CO_IDS) s.prices[id].history[s.round] = s.prices[id].price;
+  s.lastSpin.ranks = rk.map(r => ({ id: r.id, nw: r.nw, rank: r.rank, delta: prevRank[r.id] ? prevRank[r.id] - r.rank : 0 }));
+  for (const p of players(s)) {
+    const nw = netWorth(s, p);
+    if (nw > p.stats.peak) p.stats.peak = nw;
+    const gain = nw - (s.lastSpin.before[p.id] ?? nw);
+    if (gain > p.stats.bestGain) p.stats.bestGain = gain;
+    if (gain < p.stats.worstLoss) p.stats.worstLoss = gain;
+  }
   s.phase = 'trade';
   s.tradeStartedAt = now;
 }
 
-// ---------- 売り買い ----------
+// ---------- 売り買い（自分の番だけ） ----------
 
 function tradeCtx(s, pid) {
   if (s.phase !== 'trade') return [null, err('今は売り買いの時間じゃない')];
+  if (s.turn !== pid) return [null, err('自分の番になったら売り買いできる')];
   const p = s.players[pid];
   if (!p) return [null, err('プレイヤーが見つからない')];
-  if (p.done) return [null, err('「おしまい」を押したあとは売り買いできない。「まだやる」で戻れるわ')];
   return [p, null];
 }
 
@@ -287,6 +298,7 @@ export function buy(s, pid, id, qty) {
   p.cash -= cost;
   p.shares[id] = (p.shares[id] || 0) + qty;
   p.stats.trades += 1;
+  if (id === 'dragon' && p.shares[id] > p.stats.dragonMax) p.stats.dragonMax = p.shares[id];
   log(s, `🛒 ${p.name} が ${c.emoji}${c.short} を ${qty}株 買った（${fmt(priceOf(s, id))}G）`);
   return ok();
 }
@@ -305,33 +317,47 @@ export function sell(s, pid, id, qty) {
   return ok();
 }
 
-// ---------- ラウンド進行 ----------
+// ---------- 手番の進行 ----------
 
-export function setDone(s, pid, done, now = Date.now()) {
+export function endTurn(s, pid, now = Date.now()) {
   if (s.phase !== 'trade') return err('今はその時間じゃない');
-  const p = s.players[pid]; if (!p) return err('プレイヤーが見つからない');
-  p.done = !!done;
-  if (players(s).every(x => x.done)) advanceRound(s, now);
+  if (s.turn !== pid) return err('自分の番じゃない');
+  nextTurn(s, now);
   return ok();
 }
 
-export function forceAdvance(s, pid, now = Date.now()) {
-  if (s.phase !== 'trade') return err('今はその時間じゃない');
-  if (s.hostId !== pid) return err('進められるのは部屋を作った人だけ');
-  advanceRound(s, now);
+// 部屋を作った人が、動かない人の番を飛ばす
+export function skipTurn(s, pid, now = Date.now()) {
+  if (s.hostId !== pid) return err('飛ばせるのは部屋を作った人だけ');
+  if (s.phase === 'robber') {
+    // 盗賊の行き先が決まらないときは、いちばん高い株に置く
+    const top = CO_IDS.reduce((b, id) => (priceOf(s, id) > priceOf(s, b) ? id : b), CO_IDS[0]);
+    return placeRobber(s, s.turn, top, now);
+  }
+  if (s.phase !== 'spin' && s.phase !== 'trade') return err('今はその時間じゃない');
+  log(s, `⏭ ${s.players[s.turn]?.name} の番を飛ばした`);
+  nextTurn(s, now);
   return ok();
 }
 
-function advanceRound(s, now) {
-  if (s.round >= s.settings.rounds) { finish(s, now); return; }
-  s.phase = 'roll';
-  s.dealer = s.order[s.round % s.order.length];
-  for (const p of players(s)) p.done = false;
+function nextTurn(s, now) {
+  s.turnIdx += 1;
+  if (s.turnIdx >= s.order.length) {
+    // 1ラウンド終了：みんなのお金を記録
+    for (const p of players(s)) p.history[s.round] = netWorth(s, p);
+    for (const id of CO_IDS) s.prices[id].history[s.round] = s.prices[id].price;
+    if (s.round >= s.settings.rounds) { finish(s, now); return; }
+    s.round += 1;
+    s.turnIdx = 0;
+  }
+  s.turn = s.order[s.turnIdx];
+  s.phase = 'spin';
 }
 
 export function finish(s, now = Date.now()) {
-  for (const p of players(s)) { p.final = netWorth(s, p); p.done = false; }
+  for (const p of players(s)) p.final = netWorth(s, p);
   s.phase = 'end';
+  s.turn = null;
   s.finishedAt = now;
   const rk = ranking(s);
   s.results = rk.map(r => r.id);
@@ -351,6 +377,7 @@ export function titles(s) {
   m = maxBy(p => p.stats.dragonMax); if (m && m.stats.dragonMax >= 5) assign(m, '竜の山の大ばくち打ち');
   m = maxBy(p => p.stats.bestGain); if (m && m.stats.bestGain > 0) assign(m, '一発逆転の人');
   m = maxBy(p => -p.stats.worstLoss); if (m && m.stats.worstLoss < 0) assign(m, '嵐にのまれた船長');
+  m = maxBy(p => p.stats.lucky); if (m && m.stats.lucky >= 2) assign(m, '幸運の持ち主');
   m = maxBy(p => p.stats.trades); if (m && m.stats.trades > 0) assign(m, '売り買いマシン');
   for (const p of ps) if (p.stats.sells === 0 && p.stats.trades > 0) assign(p, 'ガチホの達人');
   if (ps.length > 1) assign(ps[ps.length - 1], '次はきっと勝てる');

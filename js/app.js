@@ -1,21 +1,24 @@
-// 画面と通信（シンプル版）。ルール計算は engine.js に任せ、ここでは
+// 画面と通信（ルーレット版）。ルール計算は engine.js に任せ、ここでは
 //   1. Firebase の部屋(rooms/{code})を購読して state を受け取る
 //   2. state から HTML を組み立てて描く
 //   3. ボタン操作を engine の関数に変換してトランザクションで送る
-// だけをやる。
+//   4. ルーレットの回転アニメーションと効果音
+// をやる。
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js';
 import {
   getDatabase, ref, get, set, onValue, runTransaction, query, orderByChild, limitToLast,
 } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-database.js';
 import { firebaseConfig } from './firebase-config.js';
 import * as E from './engine.js';
-import { COMPANIES, CHARACTERS, EXTRAS, LESSON, QUIZ, TOWN_NAME, fmt, fmtG, pct } from './data.js';
+import { COMPANIES, CHARACTERS, WHEEL, WHEEL_META, EXTRAS, LESSON, QUIZ, TOWN_NAME, fmt, fmtG, pct } from './data.js';
 
 window.__booted = true;
 
 const $app = document.getElementById('app');
 const LS_SESSION = 'catan-kabu-session';
+const LS_SOUND = 'catan-kabu-sound';
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const SEG = 360 / WHEEL.length;
 
 let db = null;
 let state = null;        // 部屋の最新状態（engine.normalize 済み）
@@ -30,7 +33,7 @@ const ui = {
   code: '', pid: '', name: '', charId: '',
   tab: 'market',
   sheet: null, qty: 1, sheetAnim: false, modalAnim: false,
-  seenRoll: 0,
+  seenSpin: 0, spinning: false,
   modal: null,
   toast: null,
   lesson: { step: 0, answers: {} },
@@ -45,9 +48,10 @@ const uid = () => 'u' + Math.random().toString(36).slice(2, 10) + Date.now().toS
 const charOf = p => E.charInfo(p.charId) || CHARACTERS[0];
 const me = () => (state && state.players[ui.pid]) || null;
 const isHost = () => state && state.hostId === ui.pid;
-const DIE = ['', '⚀', '⚁', '⚂', '⚃', '⚄', '⚅'];
+const myTurn = () => state && state.turn === ui.pid;
 const clsChg = v => (v > 0 ? 'up' : v < 0 ? 'down' : 'flat');
 const arrow = v => (v > 0 ? '▲' : v < 0 ? '▼' : '－');
+const segInfo = w => (w.type === 'co' ? { emoji: E.coInfo(w.co).emoji, label: E.coInfo(w.co).short, color: E.coInfo(w.co).color } : WHEEL_META[w.type]);
 
 function avatar(p, size = '') {
   const c = charOf(p);
@@ -69,6 +73,76 @@ function clearSession() {
   try { localStorage.removeItem(LS_SESSION); } catch {}
 }
 
+// ---------- 効果音（ルーレットのカチカチ音とチーン） ----------
+const sfx = (() => {
+  let ctx = null;
+  const enabled = () => { try { return localStorage.getItem(LS_SOUND) !== 'off'; } catch { return true; } };
+  function ac() {
+    if (!ctx) { const C = window.AudioContext || window.webkitAudioContext; if (!C) return null; ctx = new C(); }
+    if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+    return ctx;
+  }
+  function beep(freq, dur, gain = 0.08, type = 'square', when = 0) {
+    const c = ac(); if (!c) return;
+    const o = c.createOscillator(), g = c.createGain();
+    o.type = type; o.frequency.value = freq;
+    const t0 = c.currentTime + when;
+    g.gain.setValueAtTime(gain, t0);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(g).connect(c.destination);
+    o.start(t0); o.stop(t0 + dur + 0.02);
+  }
+  return {
+    enabled,
+    toggle() { try { localStorage.setItem(LS_SOUND, enabled() ? 'off' : 'on'); } catch {} },
+    unlock() { if (enabled()) { try { ac(); } catch {} } },
+    tick() { if (enabled()) { try { beep(1400, 0.03, 0.05); } catch {} } try { navigator.vibrate && navigator.vibrate(6); } catch {} },
+    ding() { if (enabled()) { try { beep(880, 0.18, 0.1, 'sine'); beep(1320, 0.35, 0.1, 'sine', 0.14); } catch {} } try { navigator.vibrate && navigator.vibrate([40, 30, 80]); } catch {} },
+  };
+})();
+document.addEventListener('pointerdown', () => sfx.unlock(), { once: true });
+
+// ---------- ルーレットのアニメーション ----------
+// 回した人の端末が結果（止まるマス）を決めてサーバーに書き、全員の端末がその位置に向けて同じ回転を再生する
+const spinDuration = () => (window.__fastSpin ? 400 : 4600);
+let anim = null; // { id, start, final, angle, lastSeg }
+const restAngle = L => 360 - (L.seg * SEG + L.jitter * SEG);
+function startAnim(L) {
+  anim = { id: L.id, start: performance.now(), final: 360 * 6 + restAngle(L), angle: 0, lastSeg: -1 };
+  ui.spinning = true;
+  ui.modal = null;
+  ui.sheet = null;
+  sfx.unlock();
+  requestAnimationFrame(frame);
+}
+function frame(ts) {
+  if (!anim) return;
+  const t = Math.min(1, (ts - anim.start) / spinDuration());
+  const e = 1 - Math.pow(1 - t, 3);
+  anim.angle = anim.final * e;
+  const el = document.getElementById('wheel-rot');
+  if (el) el.style.transform = `rotate(${anim.angle}deg)`;
+  const seg = Math.floor(((360 - (anim.angle % 360)) % 360) / SEG);
+  if (seg !== anim.lastSeg) { anim.lastSeg = seg; sfx.tick(); }
+  if (t < 1) requestAnimationFrame(frame);
+  else finishAnim();
+}
+function finishAnim() {
+  const id = anim.id;
+  anim = null;
+  ui.spinning = false;
+  ui.seenSpin = id;
+  sfx.ding();
+  ui.modalAnim = true;
+  ui.modal = { type: 'spin' };
+  render();
+}
+function currentAngle() {
+  if (anim) return anim.angle;
+  if (state && state.lastSpin) return restAngle(state.lastSpin);
+  return 0;
+}
+
 // ---------- Firebase ----------
 const configured = () => firebaseConfig && firebaseConfig.apiKey && !String(firebaseConfig.apiKey).startsWith('YOUR_') && firebaseConfig.databaseURL && !String(firebaseConfig.databaseURL).includes('YOUR_');
 const roomRef = code => ref(db, 'rooms/' + code);
@@ -79,7 +153,6 @@ function detach() {
   state = null;
 }
 
-// 部屋を購読する。最初のデータが来たら resolve
 function attach(code) {
   detach();
   ui.code = code;
@@ -104,7 +177,6 @@ function attach(code) {
   });
 }
 
-// engine の関数をトランザクションで実行する
 async function mutate(fn) {
   if (!db || !ui.code) return false;
   let error = null;
@@ -179,14 +251,15 @@ async function rejoin(sess) {
     }
     detach(); clearSession(); ui.pid = ''; ui.screen = 'title'; render(); return;
   }
-  if (s.lastRoll) ui.seenRoll = s.phase === 'robber' ? s.lastRoll.round - 1 : s.lastRoll.round;
+  if (s.lastSpin) ui.seenSpin = s.lastSpin.id;
   render();
 }
 
 function leaveLocal() {
   detach();
   clearSession();
-  ui.pid = ''; ui.code = ''; ui.overlay = null; ui.modal = null; ui.sheet = null; ui.seenRoll = 0;
+  anim = null;
+  ui.pid = ''; ui.code = ''; ui.overlay = null; ui.modal = null; ui.sheet = null; ui.seenSpin = 0; ui.spinning = false;
   ui.screen = 'title';
   render();
 }
@@ -244,17 +317,15 @@ function onState() {
     onState._rejoining = true;
     mutate(st => E.addPlayer(st, { id: ui.pid, name: ui.name, charId: ui.charId }, now())).finally(() => { onState._rejoining = false; });
   }
-  if (s.lastRoll && s.phase !== 'lobby' && s.phase !== 'end' && s.lastRoll.round > ui.seenRoll && (!ui.modal || ui.modal.type === 'roll')) {
-    ui.modalAnim = true;
-    ui.modal = { type: 'roll' };
-    ui.sheet = null;
+  if (s.lastSpin && s.phase !== 'lobby' && s.phase !== 'end' && s.lastSpin.id > ui.seenSpin && !anim) {
+    startAnim(s.lastSpin);
   }
   if (s.phase === 'end') {
     ui.sheet = null;
-    if (ui.modal && ui.modal.type === 'roll') ui.modal = null;
+    if (ui.modal && ui.modal.type === 'spin') ui.modal = null;
     if (!s.saved && isHost()) saveHistory();
   }
-  if (s.phase === 'lobby' && ui.modal && ui.modal.type === 'roll') ui.modal = null;
+  if (s.phase === 'lobby') { anim = null; ui.spinning = false; ui.seenSpin = 0; if (ui.modal && ui.modal.type === 'spin') ui.modal = null; }
   render();
 }
 
@@ -333,7 +404,7 @@ function titleScreen() {
         <button class="btn ghost" data-act="goRecords">📊 成績</button>
       </div>
     </div>
-    <p class="foot">2〜4人・1ゲーム 20〜30分</p>
+    <p class="foot">2〜4人・1ゲーム 15〜30分</p>
     <button class="btn ghost tiny" data-act="goLesson">🎒 おまけ：こどもNISAのはなし</button>
   </div>`;
 }
@@ -380,31 +451,82 @@ function lobbyScreen() {
       <div class="card">
         <h3>設定 ${host ? '' : '<small>（部屋を作った人が決める）</small>'}</h3>
         <label class="setrow"><span>ラウンド数</span><select data-act="setting" data-key="rounds" ${host ? '' : 'disabled'}>${E.RULES.ROUND_OPTIONS.map(o => `<option value="${o}" ${o === st.rounds ? 'selected' : ''}>${o}ラウンド</option>`).join('')}</select></label>
-        <p class="hint">1ラウンド 2分くらい。${st.rounds}ラウンドなら約${st.rounds * 2}分。</p>
+        <p class="hint">1ラウンド＝全員が1回ずつ回す。${st.rounds}ラウンドなら ${ps.length || 2}人で約${Math.round(st.rounds * (ps.length || 2) * 0.6)}分。</p>
         <label class="setrow col"><span>😈 負けた人のおねがい</span><input data-act="setting" data-key="stakeLoser" maxlength="40" placeholder="例：皿洗い1週間" value="${esc(st.stakeLoser)}" ${host ? '' : 'disabled'}></label>
         <label class="setrow col"><span>👑 勝った人のごほうび</span><input data-act="setting" data-key="stakeWinner" maxlength="40" placeholder="例：夕ごはんを決める" value="${esc(st.stakeWinner)}" ${host ? '' : 'disabled'}></label>
       </div>
-      ${host ? `<button class="btn primary big" data-act="start">🎲 ゲームスタート</button>` : `<p class="waiting">👑 ${esc(s.players[s.hostId]?.name || '')} がスタートするのを待ってる…</p>`}
+      ${host ? `<button class="btn primary big" data-act="start">🎡 ゲームスタート</button>` : `<p class="waiting">👑 ${esc(s.players[s.hostId]?.name || '')} がスタートするのを待ってる…</p>`}
       <button class="btn ghost" data-act="goHowto">📖 あそびかた</button>
     </main></div>`;
 }
 
 // ---- ゲーム画面 ----
+// 回転中はネタバレしないように、回す前の値段・お金で表示する
+function priceView(s, id) {
+  const x = s.prices[id];
+  if (ui.spinning) return { price: x.prev, chg: 0 };
+  return { price: x.price, chg: x.prev ? x.price / x.prev - 1 : 0 };
+}
+function nwView(s, p) {
+  if (ui.spinning && s.lastSpin && s.lastSpin.before[p.id] != null) return s.lastSpin.before[p.id];
+  return E.netWorth(s, p);
+}
+
 function scoreboard(s) {
-  const rk = E.ranking(s);
+  const rk = E.players(s).map(p => ({ id: p.id, nw: nwView(s, p) })).sort((a, b) => b.nw - a.nw);
   const deltas = {};
-  if (s.lastRoll) for (const r of s.lastRoll.ranks) deltas[r.id] = r.delta;
-  return `<div class="score">${rk.map(r => {
+  if (s.lastSpin && !ui.spinning) for (const r of s.lastSpin.ranks) deltas[r.id] = r.delta;
+  return `<div class="score">${rk.map((r, i) => {
     const p = s.players[r.id];
     const d = deltas[r.id] || 0;
-    return `<div class="srow ${r.id === ui.pid ? 'me' : ''}"><span class="srank">${r.rank}</span>${avatar(p, 'sm')}<span class="sname">${esc(p.name)}${r.id === s.dealer && s.phase !== 'trade' ? ' 🎲' : ''}${p.done && s.phase === 'trade' ? ' ✓' : ''}</span><span class="snw">${fmtG(r.nw)}</span><span class="sdelta ${clsChg(d)}">${d > 0 ? '▲' : d < 0 ? '▼' : ''}</span></div>`;
+    const turn = s.turn === r.id;
+    return `<div class="srow ${r.id === ui.pid ? 'me' : ''} ${turn ? 'turn' : ''}"><span class="srank">${i + 1}</span>${avatar(p, 'sm')}<span class="sname">${esc(p.name)}${turn ? ' <i class="tmark">🎯</i>' : ''}</span><span class="snw">${fmtG(r.nw)}</span><span class="sdelta ${clsChg(d)}">${d > 0 ? '▲' : d < 0 ? '▼' : ''}</span></div>`;
   }).join('')}</div>`;
+}
+
+let wheelSvgCache = '';
+function wheelSVG() {
+  if (wheelSvgCache) return wheelSvgCache;
+  const N = WHEEL.length, R = 150, cx = 160, cy = 160;
+  let parts = '';
+  for (let i = 0; i < N; i++) {
+    const a0 = (i * SEG - 90) * Math.PI / 180, a1 = ((i + 1) * SEG - 90) * Math.PI / 180;
+    const x0 = cx + R * Math.cos(a0), y0 = cy + R * Math.sin(a0), x1 = cx + R * Math.cos(a1), y1 = cy + R * Math.sin(a1);
+    const info = segInfo(WHEEL[i]);
+    const mid = (i + 0.5) * SEG - 90, mr = mid * Math.PI / 180;
+    const tx = cx + R * 0.74 * Math.cos(mr), ty = cy + R * 0.74 * Math.sin(mr);
+    parts += `<path d="M${cx},${cy} L${x0.toFixed(1)},${y0.toFixed(1)} A${R},${R} 0 0 1 ${x1.toFixed(1)},${y1.toFixed(1)} Z" fill="${info.color}" stroke="#fff" stroke-width="2"/>`;
+    parts += `<text x="${tx.toFixed(1)}" y="${ty.toFixed(1)}" font-size="22" text-anchor="middle" dominant-baseline="central" transform="rotate(${(mid + 90).toFixed(1)} ${tx.toFixed(1)} ${ty.toFixed(1)})">${info.emoji}</text>`;
+  }
+  wheelSvgCache = `<svg viewBox="0 0 320 320" class="wheelsvg" aria-hidden="true">${parts}<circle cx="${cx}" cy="${cy}" r="40" fill="#fffaf0" stroke="#e4d6bd" stroke-width="3"/></svg>`;
+  return wheelSvgCache;
+}
+
+function wheelBox(s) {
+  const turnP = s.players[s.turn];
+  const tn = turnP ? esc(turnP.name) : '';
+  let center;
+  if (ui.spinning) center = `<div class="wheelwait spinning">🎡</div>`;
+  else if (s.phase === 'spin' && myTurn()) center = `<button class="spinbtn" data-act="spin">回す！</button>`;
+  else if (s.phase === 'spin') center = `<div class="wheelwait">${charOf(turnP || me()).emoji}</div>`;
+  else center = `<div class="wheelwait">${turnP ? charOf(turnP).emoji : '🎡'}</div>`;
+  let caption;
+  if (ui.spinning) caption = `🎡 ${tn} が回した！`;
+  else if (s.phase === 'spin') caption = myTurn() ? '<b>あなたの番！</b> まん中を押して回す' : `${tn} の番。回すのを待ってる…`;
+  else if (s.phase === 'robber') caption = myTurn() ? '🏴‍☠️ 盗賊をどこに送る？' : `🏴‍☠️ ${tn} が盗賊の行き先を考え中…`;
+  else caption = '';
+  const legend = Object.entries(WHEEL_META).map(([k, m]) => `<span>${m.emoji}${m.label}</span>`).join('');
+  return `<div class="wheelbox">
+    <div class="wheelwrap"><div class="pointer"></div><div class="wheel" id="wheel-rot" style="transform:rotate(${currentAngle().toFixed(2)}deg)">${wheelSVG()}</div>${center}</div>
+    <div class="wcaption">${caption}</div>
+    <div class="wlegend">${legend}</div>
+  </div>`;
 }
 
 function gameScreen() {
   const s = state;
   const p = me();
-  const phaseLabel = s.phase === 'roll' ? '🎲 サイコロ' : s.phase === 'robber' ? '🏴‍☠️ 盗賊' : '🛒 売り買いタイム';
+  const turnP = s.players[s.turn];
   const tabs = [['market', '市場'], ['chart', 'グラフ'], ['news', 'ニュース']];
   let body;
   switch (ui.tab) {
@@ -412,70 +534,59 @@ function gameScreen() {
     case 'news': body = newsTab(s); break;
     default: body = marketTab(s, p);
   }
+  const showWheel = s.phase === 'spin' || s.phase === 'robber' || ui.spinning;
   return `<div class="screen game">
     <header class="gamebar">
       <div class="round">R<b>${s.round}</b>/${s.settings.rounds}</div>
-      <div class="phase">${phaseLabel}</div>
-      <div class="mine">💰 ${fmtG(p.cash)}</div>
+      <div class="phase">${turnP ? `${charOf(turnP).emoji} ${esc(turnP.name)}の番` : ''}</div>
+      <div class="mine">💰 ${fmtG(ui.spinning && s.lastSpin.before[p.id] != null ? p.cash - (E.netWorth(s, p) - s.lastSpin.before[p.id]) : p.cash)}</div>
       <button class="iconbtn" data-act="menu" aria-label="メニュー">☰</button>
     </header>
     ${scoreboard(s)}
-    ${phaseStrip(s, p)}
+    ${showWheel ? wheelBox(s) : tradeStrip(s, p)}
+    ${showWheel && !ui.spinning && s.phase === 'robber' && myTurn() ? `<div class="strip robber"><div class="choices">${COMPANIES.map(c => `<button class="btn sm" data-act="robber" data-id="${c.id}">${c.emoji}${esc(c.short)}</button>`).join('')}</div></div>` : ''}
+    ${isHost() && !myTurn() && !ui.spinning ? `<button class="btn ghost tiny" data-act="skipConfirm">⏭ ${turnP ? esc(turnP.name) : ''} の番を飛ばす</button>` : ''}
     <nav class="tabs three">${tabs.map(([k, l]) => `<button class="${ui.tab === k ? 'on' : ''}" data-act="tab" data-tab="${k}">${l}</button>`).join('')}</nav>
     <main class="tabbody">${body}</main>
     ${ui.sheet ? sheetHtml(s, p) : ''}
   </div>`;
 }
 
-function phaseStrip(s, p) {
-  const dealer = s.players[s.dealer];
-  const dn = dealer ? esc(dealer.name) : '';
-  if (s.phase === 'roll') {
-    if (s.dealer === ui.pid) return `<div class="strip roll"><button class="btn primary big" data-act="roll">🎲 サイコロを振る</button></div>`;
-    return `<div class="strip wait">🎲 ${dn} がサイコロを振るのを待ってる…</div>`;
+function tradeStrip(s, p) {
+  const turnP = s.players[s.turn];
+  if (myTurn()) {
+    return `<div class="strip trade"><div class="stat"><b>あなたの番！</b> 買う？売る？</div><button class="btn primary" data-act="endTurn">次の人へ ▶</button></div>`;
   }
-  if (s.phase === 'robber') {
-    if (s.dealer === ui.pid) return `<div class="strip robber"><div>🏴‍☠️ 盗賊をどの会社に送る？（−25%）</div><div class="choices">${COMPANIES.map(c => `<button class="btn sm" data-act="robber" data-id="${c.id}">${c.emoji}${esc(c.short)}</button>`).join('')}</div></div>`;
-    return `<div class="strip wait">🏴‍☠️ ${dn} が盗賊の行き先を考え中…</div>`;
-  }
-  const ps = E.players(s);
-  const btn = p.done
-    ? `<button class="btn" data-act="undone">↩️ まだやる</button>`
-    : `<button class="btn primary" data-act="done">✅ おしまい</button>`;
-  const waiting = ps.filter(x => !x.done).length;
-  const force = isHost() && waiting > 0 && p.done ? `<button class="btn ghost sm" data-act="forceNext">⏭ 待たずに進める</button>` : '';
-  return `<div class="strip trade"><div class="stat">${p.done ? `あと ${waiting} 人を待ってる…` : '買う？売る？決まったら →'}</div>${btn}${force}</div>`;
+  return `<div class="strip wait">🛒 ${turnP ? esc(turnP.name) : ''} が売り買い中…（あなたの番になったら買える）</div>`;
 }
 
 function marketTab(s, p) {
   const rows = COMPANIES.map(c => {
-    const x = s.prices[c.id];
-    const chg = x.prev ? x.price / x.prev - 1 : 0;
+    const v = priceView(s, c.id);
     const q = p.shares[c.id] || 0;
-    const news = s.lastRoll && s.lastRoll.co === c.id;
+    const news = !ui.spinning && s.lastSpin && s.lastSpin.co === c.id;
     return `<button class="card co ${news ? 'news' : ''}" data-act="sheet" data-id="${c.id}" style="--c:${c.color}">
       <span class="emoji">${c.emoji}</span>
       <div class="co-name"><b>${esc(c.short)}${s.robber === c.id ? ' 🏴‍☠️' : ''}</b><small>${esc(c.mood)}</small></div>
-      <div class="price"><b>${fmt(x.price)}G</b><small class="${clsChg(chg)}">${arrow(chg)} ${pct(chg)}</small></div>
-      <div class="have">${q ? `<b>${q}</b>株<small>${fmtG(q * x.price)}</small>` : '<small>なし</small>'}</div>
+      <div class="price"><b>${fmt(v.price)}G</b><small class="${clsChg(v.chg)}">${ui.spinning ? '' : arrow(v.chg) + ' ' + pct(v.chg)}</small></div>
+      <div class="have">${q ? `<b>${q}</b>株<small>${fmtG(q * v.price)}</small>` : '<small>なし</small>'}</div>
     </button>`;
   }).join('');
-  return `<section>${rows}</section><p class="hint">会社をタップすると買ったり売ったりできる</p>`;
+  return `<section>${rows}</section><p class="hint">${myTurn() && s.phase === 'trade' ? '会社をタップして買う・売る' : '自分の番になったら、会社をタップして買う・売る'}</p>`;
 }
 
 function sheetHtml(s, p) {
   const id = ui.sheet;
   const c = E.coInfo(id);
   if (!c) { ui.sheet = null; return ''; }
-  const x = s.prices[id];
-  const price = x.price;
+  const v = priceView(s, id);
+  const price = v.price;
   const q = p.shares[id] || 0;
   const qty = Math.max(1, Math.floor(Number(ui.qty) || 1));
-  const canTrade = s.phase === 'trade' && !p.done;
+  const canTrade = s.phase === 'trade' && myTurn() && !ui.spinning;
   const maxBuy = Math.floor(p.cash / price);
-  const chg = x.prev ? price / x.prev - 1 : 0;
   return `<div class="sheet-bg" data-act="closeSheet"></div><div class="sheet ${ui.sheetAnim ? 'anim' : ''}" style="--c:${c.color}">
-    <div class="sheet-head"><span class="emoji">${c.emoji}</span><div><b>${esc(c.name)}</b><small>${esc(c.mood)}・出目 ${c.numbers.join('・')}</small></div><div class="price"><b>${fmt(price)}G</b><small class="${clsChg(chg)}">${arrow(chg)} ${pct(chg)}</small></div><button class="iconbtn" data-act="closeSheet">✕</button></div>
+    <div class="sheet-head"><span class="emoji">${c.emoji}</span><div><b>${esc(c.name)}</b><small>${esc(c.mood)}</small></div><div class="price"><b>${fmt(price)}G</b><small class="${clsChg(v.chg)}">${arrow(v.chg)} ${pct(v.chg)}</small></div><button class="iconbtn" data-act="closeSheet">✕</button></div>
     <div class="mypos"><span>持ってる：<b>${q}株</b>（${fmtG(q * price)}）</span><span>さいふ：<b>${fmtG(p.cash)}</b></span></div>
     <div class="qty">
       <button class="btn sm" data-act="qty" data-d="-5">−5</button><button class="btn sm" data-act="qty" data-d="-1">−1</button>
@@ -486,17 +597,13 @@ function sheetHtml(s, p) {
       <div class="actrow"><button class="btn buy" data-act="buy" ${canTrade && qty <= maxBuy ? '' : 'disabled'}>買う <small>−${fmtG(price * qty)}</small></button><button class="btn ghost sm" data-act="qtyMax" data-n="${maxBuy}">全力 ${maxBuy}株</button></div>
       <div class="actrow"><button class="btn sell" data-act="sell" ${canTrade && q >= qty ? '' : 'disabled'}>売る <small>+${fmtG(price * qty)}</small></button><button class="btn ghost sm" data-act="qtyMax" data-n="${q}">全部 ${q}株</button></div>
     </div>
-    ${!canTrade ? `<p class="hint">${s.phase !== 'trade' ? '売り買いタイムになったら買える' : '「まだやる」を押すと買える'}</p>` : ''}
+    ${!canTrade ? `<p class="hint">自分の番で、ルーレットを回したあとに買える</p>` : ''}
   </div>`;
 }
 
 function newsTab(s) {
   const logs = [...s.log].reverse().map(l => `<li><small>R${l.r}</small> ${esc(l.t)}</li>`).join('');
   return `<div class="card"><ul class="loglist">${logs || '<li>まだ何もない</li>'}</ul></div>`;
-}
-
-function diceHtml(r) {
-  return `<div class="dice"><span class="die">${DIE[r.d1]}</span><span class="die">${DIE[r.d2]}</span><span class="sum">= ${r.sum}</span></div>`;
 }
 
 function chartSVG(s, h = 230) {
@@ -528,8 +635,8 @@ function chartSVG(s, h = 230) {
     const last = se.data.length - 1;
     lines += `<circle cx="${x(last).toFixed(1)}" cy="${y(se.data[last]).toFixed(1)}" r="4" fill="${se.color}"/>`;
   }
-  const legend = series.map(se => `<span class="lg"><i style="background:${se.color}"></i>${se.emoji}${esc(se.name)} <b>${fmtG(se.data[se.data.length - 1] || 0)}</b></span>`).join('');
-  return `<svg viewBox="0 0 ${W} ${h}" class="chart" role="img" aria-label="お金の推移">${g}${lines}</svg><div class="legend">${legend}</div>`;
+  const legend = series.map(se => `<span class="lg"><i style="background:${se.color}"></i>${se.emoji}${esc(se.name)} <b>${fmtG(E.netWorth(s, s.players[E.players(s).find(p => p.name === se.name).id]))}</b></span>`).join('');
+  return `<svg viewBox="0 0 ${W} ${h}" class="chart" role="img" aria-label="お金の推移">${g}${lines}</svg><div class="legend">${legend}</div><p class="hint">ラウンドごとのお金（現金＋株）。</p>`;
 }
 
 // ---- 結果 ----
@@ -634,14 +741,14 @@ function howtoScreen(standalone) {
   const back = standalone ? 'goTitle' : 'back';
   return `<div class="screen">${topbar('📖 あそびかた', back)}<main>
     <div class="card"><h3>🎯 ゴール</h3><p>最後のラウンドが終わったとき、<b>お金＋持ってる株の値段</b>が一番多い人の勝ち。みんな 1,000G からスタート。</p></div>
-    <div class="card"><h3>🎲 1ラウンド</h3><ol class="steps">
-      <li><b>親がサイコロを2つ振る。</b>合計の数字の会社に<b>ニュース</b>が起きて、株が上がったり下がったりする。</li>
-      <li><b>7が出たら盗賊。</b>親が好きな会社に送りこむ。その株は −25%。</li>
-      <li><b>ゾロ目は号外。</b>町じゅうの株がドーンと上がるか、ドーンと下がる。</li>
-      <li><b>みんなで買ったり売ったりする。</b>全員が「おしまい」を押したら次のラウンド。</li></ol></div>
-    <div class="card"><h3>🏢 5つの会社</h3>
-      ${COMPANIES.map(c => `<p>${c.emoji} <b>${esc(c.short)}</b>（出目 ${c.numbers.join('・')}）：${esc(c.mood)}</p>`).join('')}
-      <p class="hint">6・8 はよく出る。2・12 はめったに出ない。でも出たときは大きい。</p></div>
+    <div class="card"><h3>🎡 自分の番にやること</h3><ol class="steps">
+      <li><b>ルーレットを回す。</b>止まった会社にニュースが起きて、株が上がったり下がったりする。</li>
+      <li><b>買うか売るか決める。</b>決まったら「次の人へ」。</li></ol>
+      <p class="hint">全員が1回ずつ回したら1ラウンド。</p></div>
+    <div class="card"><h3>🎡 ルーレットのマス</h3>
+      ${COMPANIES.map(c => `<p>${c.emoji} <b>${esc(c.short)}</b>（${WHEEL.filter(w => w.co === c.id).length}マス）：${esc(c.mood)}</p>`).join('')}
+      ${Object.entries(WHEEL_META).map(([k, m]) => `<p>${m.emoji} <b>${esc(m.label)}</b>（${WHEEL.filter(w => w.type === k).length}マス）：${esc(m.desc)}</p>`).join('')}
+      <p class="hint">マスが多い会社ほどよくニュースが起きる。🏮は小さく動き、⛏️はめったに止まらないけど動きがデカい。</p></div>
   </main></div>`;
 }
 
@@ -651,40 +758,45 @@ function modalHtml() {
   if (!m) return '';
   const s = state;
   const anim = ui.modalAnim ? ' anim' : '';
-  if (m.type === 'roll' && s && s.lastRoll) {
-    const r = s.lastRoll;
-    const dealer = s.players[r.dealer];
+  if (m.type === 'spin' && s && s.lastSpin) {
+    const L = s.lastSpin;
+    const by = s.players[L.by];
+    const bn = esc(by?.name || '');
     const waiting = s.phase === 'robber';
-    let newsHtml = '';
-    if (r.co && r.card) {
-      const c = E.coInfo(r.co);
-      const x = s.prices[r.co];
-      const p = r.card.p;
-      newsHtml = `<div class="newscard" style="--c:${c.color}">
+    let main = '';
+    if (L.type === 'co' && L.card) {
+      const c = E.coInfo(L.co);
+      const x = s.prices[L.co];
+      const p = L.card.p;
+      main = `<div class="newscard" style="--c:${c.color}">
         <div class="nc-co">${c.emoji} ${esc(c.name)}のニュース</div>
-        <div class="nc-head">${esc(r.card.t)}</div>
+        <div class="nc-head">${esc(L.card.t)}</div>
         ${p ? `<div class="nc-pct ${clsChg(p)}">${p > 0 ? '+' : ''}${p}%</div><div class="nc-price">${fmt(x.prev)}G → <b>${fmt(x.price)}G</b></div>` : ''}
-        ${r.card.div ? `<div class="nc-pct up">1株につき ${r.card.div}G</div>` : ''}
-        ${r.divs.length ? `<div class="nc-divs">${r.divs.map(d => `💎 ${esc(s.players[d.id]?.name)} に ${fmtG(d.amount)}`).join('<br>')}</div>` : ''}
+        ${L.card.div ? `<div class="nc-pct up">1株につき ${L.card.div}G</div>` : ''}
+        ${L.divs.length ? `<div class="nc-divs">${L.divs.map(d => `💎 ${esc(s.players[d.id]?.name)} に ${fmtG(d.amount)}`).join('<br>')}</div>` : L.card.div ? '<div class="nc-divs">持ってる人はいなかった…</div>' : ''}
       </div>`;
-    } else if (r.sum === 7) {
-      const t = r.robberTarget ? E.coInfo(r.robberTarget) : null;
-      newsHtml = `<div class="newscard robber"><div class="nc-co">🏴‍☠️ 盗賊があらわれた！</div>${t ? `<div class="nc-head">${esc(dealer?.name)} が盗賊を ${t.emoji}${esc(t.short)} に送りこんだ</div><div class="nc-pct down">−25%</div><div class="nc-price">${fmt(s.prices[t.id].prev)}G → <b>${fmt(s.prices[t.id].price)}G</b></div>` : `<div class="nc-head">${esc(dealer?.name)} が行き先を決める</div>`}</div>`;
+    } else if (L.type === 'robber') {
+      const t = L.robberTarget ? E.coInfo(L.robberTarget) : null;
+      main = `<div class="newscard robber"><div class="nc-co">🏴‍☠️ 盗賊があらわれた！</div>${t ? `<div class="nc-head">${bn} が盗賊を ${t.emoji}${esc(t.short)} に送りこんだ</div><div class="nc-pct down">−25%</div><div class="nc-price">${fmt(s.prices[t.id].prev)}G → <b>${fmt(s.prices[t.id].price)}G</b></div>` : `<div class="nc-head">${bn} が行き先を決める</div>`}</div>`;
+    } else if (L.type === 'extra') {
+      const ex = EXTRAS[L.extra];
+      main = `<div class="newscard ${L.extra}"><div class="nc-co">📰 号外！</div><div class="nc-head">${esc(ex.t)}</div><div class="nc-pct ${clsChg(ex.p)}">町じゅう ${ex.p > 0 ? '+' : ''}${ex.p}%</div></div>`;
+    } else if (L.type === 'lucky') {
+      main = `<div class="newscard lucky"><div class="nc-co">🎁 ラッキー！</div><div class="nc-head">${bn} に ${fmtG(L.lucky)}</div></div>`;
+    } else if (L.type === 'rescue' && L.rescue) {
+      main = `<div class="newscard rescue"><div class="nc-co">🍀 おたすけ！</div><div class="nc-head">ビリの ${esc(s.players[L.rescue.id]?.name)} に ${fmtG(L.rescue.amount)}</div></div>`;
     }
-    const others = COMPANIES.filter(c => c.id !== r.co && c.id !== r.robberTarget).map(c => `<span class="chip ${clsChg(r.moves[c.id] || 0)}">${c.emoji} ${arrow(r.moves[c.id] || 0)}${pct(r.moves[c.id] || 0)}</span>`).join('');
-    const extra = r.extra ? `<div class="evbanner ${r.extra === 'boom' ? 'boom' : 'crash'}">${EXTRAS[r.extra].emoji} ${esc(EXTRAS[r.extra].t)}<b>${EXTRAS[r.extra].p > 0 ? '+' : ''}${EXTRAS[r.extra].p}%</b></div>` : '';
-    const ranks = !waiting && r.ranks.length ? `<div class="ranks">${r.ranks.map(k => `<span class="${k.id === ui.pid ? 'me' : ''}">${k.rank}位 ${charOf(s.players[k.id]).emoji}${esc(s.players[k.id]?.name)} ${fmtG(k.nw)} <i class="${clsChg(k.delta)}">${k.delta > 0 ? '▲' : k.delta < 0 ? '▼' : ''}</i></span>`).join('')}</div>` : '';
-    return `<div class="modal-bg"><div class="modal rollm${anim}">
-      <small>ラウンド ${r.round}・親：${esc(dealer?.name || '')}</small>
-      ${diceHtml(r)}
-      ${newsHtml}
-      <div class="chips">${others}</div>
-      ${extra}
+    const others = COMPANIES.filter(c => L.moves[c.id] != null).map(c => `<span class="chip ${clsChg(L.moves[c.id])}">${c.emoji} ${arrow(L.moves[c.id])}${pct(L.moves[c.id])}</span>`).join('');
+    const ranks = !waiting && L.ranks.length ? `<div class="ranks">${L.ranks.map(k => `<span class="${k.id === ui.pid ? 'me' : ''}">${k.rank}位 ${charOf(s.players[k.id]).emoji}${esc(s.players[k.id]?.name)} ${fmtG(k.nw)} <i class="${clsChg(k.delta)}">${k.delta > 0 ? '▲' : k.delta < 0 ? '▼' : ''}</i></span>`).join('')}</div>` : '';
+    return `<div class="modal-bg"><div class="modal spinm${anim}">
+      <small>ラウンド ${L.round}・${bn} が回した</small>
+      ${main}
+      ${others ? `<div class="chips">${others}</div>` : ''}
       ${ranks}
-      ${waiting ? (s.dealer === ui.pid
-        ? `<div class="choices">${COMPANIES.map(c => `<button class="btn sm" data-act="robber" data-id="${c.id}">${c.emoji}${esc(c.short)}</button>`).join('')}</div>`
-        : `<p class="waiting">${esc(dealer?.name || '')} が考え中…</p>`)
-        : `<button class="btn primary big" data-act="closeRoll">OK</button>`}
+      ${waiting ? (myTurn()
+        ? `<p><b>🏴‍☠️ 盗賊をどの会社に送る？</b>（その株は −25%）</p><div class="choices">${COMPANIES.map(c => `<button class="btn sm" data-act="robber" data-id="${c.id}">${c.emoji}${esc(c.short)}</button>`).join('')}</div>`
+        : `<p class="waiting">${bn} が考え中…</p>`)
+        : `<button class="btn primary big" data-act="closeSpin">${myTurn() ? 'OK、買う・売るへ' : 'OK'}</button>`}
     </div></div>`;
   }
   if (m.type === 'confirm') {
@@ -694,6 +806,7 @@ function modalHtml() {
     return `<div class="modal-bg" data-act="closeModal"><div class="modal menu${anim}">
       <button class="btn" data-act="goHowto">📖 あそびかた</button>
       <button class="btn" data-act="goRecords">📊 成績</button>
+      <button class="btn" data-act="toggleSound">${sfx.enabled() ? '🔊 音：オン' : '🔇 音：オフ'}</button>
       <button class="btn ghost" data-act="leaveConfirm">🚪 部屋を出る</button>
       <button class="btn ghost" data-act="closeModal">閉じる</button></div></div>`;
   }
@@ -733,28 +846,33 @@ const ACT = {
     ui.modal = { type: 'confirm', title: '部屋を出る？', text: inGame ? 'ゲームの途中よ。出ても、同じスマホでこのページを開き直せば戻れる。' : 'タイトルに戻るわ。', yes: '出る', then: 'leave' };
     render();
   },
+  skipConfirm() {
+    const t = state && state.players[state.turn];
+    ui.modalAnim = true;
+    ui.modal = { type: 'confirm', title: '番を飛ばす？', text: `${t ? t.name : ''} の番を飛ばして次の人にする。席を外しているときだけ使ってね。`, yes: '飛ばす', then: 'skip' };
+    render();
+  },
   confirmYes() {
     const m = ui.modal; ui.modal = null;
     if (m && m.then === 'leave') leaveRoom();
-    else if (m && m.then === 'force') mutate(s => E.forceAdvance(s, ui.pid, now()));
+    else if (m && m.then === 'skip') mutate(s => E.skipTurn(s, ui.pid, now()));
     else render();
   },
   closeModal() { ui.modal = null; render(); },
   menu() { ui.modalAnim = true; ui.modal = { type: 'menu' }; render(); },
+  toggleSound() { sfx.toggle(); sfx.unlock(); render(); },
   tab(d) { ui.tab = d.tab; ui.sheet = null; render(); },
-  roll() { mutate(s => E.rollDice(s, ui.pid, Math.random, now())); },
+  spin() { if (ui.spinning) return; sfx.unlock(); mutate(s => E.spin(s, ui.pid, Math.random, now())); },
   robber(d) { mutate(s => E.placeRobber(s, ui.pid, d.id, now())); },
-  closeRoll() { if (state && state.lastRoll) ui.seenRoll = state.lastRoll.round; ui.modal = null; render(); },
+  closeSpin() { ui.modal = null; ui.tab = 'market'; render(); },
   sheet(d) { ui.sheet = d.id; ui.qty = 1; ui.sheetAnim = true; render(); },
   closeSheet() { ui.sheet = null; render(); },
   qty(d) { ui.qty = Math.max(1, (Math.floor(Number(ui.qty)) || 1) + Number(d.d)); render(); },
   qtyMax(d) { ui.qty = Math.max(1, Number(d.n) || 1); render(); },
   buy() { const id = ui.sheet, q = ui.qty; mutate(s => E.buy(s, ui.pid, id, q)); },
   sell() { const id = ui.sheet, q = ui.qty; mutate(s => E.sell(s, ui.pid, id, q)); },
-  done() { mutate(s => E.setDone(s, ui.pid, true, now())); },
-  undone() { mutate(s => E.setDone(s, ui.pid, false, now())); },
-  forceNext() { ui.modalAnim = true; ui.modal = { type: 'confirm', title: '進める？', text: 'まだ「おしまい」を押していない人がいる。待たずに次のラウンドに進む？', yes: '進める', then: 'force' }; render(); },
-  again() { mutate(s => E.resetToLobby(s, ui.pid)).then(okk => { if (okk) { ui.seenRoll = 0; ui.tab = 'market'; } }); },
+  endTurn() { ui.sheet = null; mutate(s => E.endTurn(s, ui.pid, now())); },
+  again() { mutate(s => E.resetToLobby(s, ui.pid)).then(okk => { if (okk) { ui.seenSpin = 0; ui.tab = 'market'; } }); },
   lessonNext() { ui.lesson.step++; render(); },
   lessonPrev() { ui.lesson.step = Math.max(0, ui.lesson.step - 1); render(); },
   quizPick(d) { ui.lesson.answers[Number(d.q)] = Number(d.i); render(); },
@@ -764,7 +882,7 @@ const ACT = {
 $app.addEventListener('click', e => {
   const el = e.target.closest('[data-act]');
   if (!el || el.disabled) return;
-  if (el.tagName === 'SELECT' || el.tagName === 'INPUT') return; // 設定の入力欄は change で送る
+  if (el.tagName === 'SELECT' || el.tagName === 'INPUT') return;
   if ((el.classList.contains('modal-bg') || el.classList.contains('sheet-bg')) && e.target !== el) return;
   const fn = ACT[el.dataset.act];
   if (fn) fn(el.dataset, el);
