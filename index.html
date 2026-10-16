@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+  <meta name="theme-color" content="#f7eedb">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="description" content="カタンのルールで株を学ぶ、家族で遊べるスマホ用ボードゲーム。信用取引・空売り・投資信託・こどもNISAのレッスン付き。">
+  <title>カタン株 〜ランタン通りの大富豪〜</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏮</text></svg>">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Zen+Maru+Gothic:wght@500;700;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div id="app"><div class="boot">🏮 ランタンに火をともしています…</div></div>
+  <script type="module" src="js/app.js"></script>
+  <script>
+    setTimeout(function () {
+      if (!window.__booted) {
+        document.getElementById('app').innerHTML =
+          '<div class="boot">読み込みに失敗したみたい。<br>ネットにつながっているか確認して、ページを再読み込みして。<br><small>（それでもダメなら js/firebase-config.js の設定を確認）</small></div>';
+      }
+    }, 10000);
+  </script>
+</body>
+</html>

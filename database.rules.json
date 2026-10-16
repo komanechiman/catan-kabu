@@ -1,0 +1,21 @@
+{
+  "rules": {
+    "rooms": {
+      "$code": {
+        ".read": true,
+        ".write": "$code.matches(/^[A-Z0-9]{4}$/)"
+      }
+    },
+    "history": {
+      ".read": true,
+      "$id": {
+        ".write": "!data.exists()",
+        "lesson": {
+          "$pid": {
+            ".write": true
+          }
+        }
+      }
+    }
+  }
+}

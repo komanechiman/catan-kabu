@@ -1,0 +1,15 @@
+{
+  "name": "catan-kabu",
+  "version": "1.0.0",
+  "private": true,
+  "description": "カタンのルールで株を学ぶ、家族で遊ぶスマホ用ボードゲーム",
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/engine.test.mjs",
+    "smoke": "node test/smoke.mjs",
+    "serve": "python3 -m http.server 8080"
+  },
+  "devDependencies": {
+    "playwright": "^1.47.0"
+  }
+}
